@@ -312,7 +312,8 @@ func compileAndRun(ctx context.Context, req *request) (*response, error) {
 		return &response{Errors: removeBanner(br.errorMessage)}, nil
 	}
 
-	execRes, err := sandboxRun(ctx, br.exePath, br.testParam)
+	// execRes, err := sandboxRun(ctx, br.exePath, br.testParam)
+	execRes, err := localRun(ctx, br.exePath, br.testParam)
 	if err != nil {
 		return nil, err
 	}
@@ -439,8 +440,12 @@ func sandboxBuild(ctx context.Context, tmpDir string, in []byte, vet bool) (br *
 	//
 	// This is necessary as .a files are no longer included in GOROOT following
 	// https://go.dev/cl/432535.
-	if err := exec.Command("cp", "-al", "/gocache", goCache).Run(); err != nil {
-		return nil, fmt.Errorf("error copying GOCACHE: %v", err)
+	playCache := os.Getenv("PLAY_GOCACHE")
+	if playCache == "" {
+		return nil, fmt.Errorf("error get env PLAY_GOCACHE")
+	}
+	if err := exec.Command("cp", "-al", playCache, goCache).Run(); err != nil {
+		return nil, fmt.Errorf("error copying GOCACHE: %v, [CMD]:cp -al %s %s", err, playCache, goCache)
 	}
 
 	var goArgs []string
@@ -451,9 +456,12 @@ func sandboxBuild(ctx context.Context, tmpDir string, in []byte, vet bool) (br *
 	}
 	goArgs = append(goArgs, "-o", br.exePath, "-tags=faketime")
 
-	cmd := exec.Command("/usr/local/go-faketime/bin/go", goArgs...)
+	if _, err := exec.LookPath("go"); err != nil {
+		os.Setenv("PATH", os.Getenv("PATH")+":"+os.Getenv("PLAY_PATH"))
+		// return nil, fmt.Errorf("go bin not in PATH, PATH=%s", os.Getenv("PATH"))
+	}
+	cmd := exec.Command("go", goArgs...)
 	cmd.Dir = tmpDir
-	cmd.Env = []string{"GOOS=linux", "GOARCH=amd64", "GOROOT=/usr/local/go-faketime"}
 	cmd.Env = append(cmd.Env, "GOCACHE="+goCache)
 	cmd.Env = append(cmd.Env, "CGO_ENABLED=0")
 	cmd.Env = append(cmd.Env, "GOEXPERIMENT="+strings.Join(exp, ","))
@@ -511,53 +519,90 @@ func sandboxBuild(ctx context.Context, tmpDir string, in []byte, vet bool) (br *
 	return br, nil
 }
 
-// sandboxRun runs a Go binary in a sandbox environment.
-func sandboxRun(ctx context.Context, exePath, testParam string) (execRes sandboxtypes.Response, err error) {
+// Run Go Binary in Local Env.
+func localRun(ctx context.Context, exePath, testParam string) (execRes sandboxtypes.Response, err error) {
 	start := time.Now()
 	defer func() {
 		status := "success"
 		if err != nil {
 			status = "error"
 		}
-		// Ignore error. The only error can be invalid tag key or value
-		// length, which we know are safe.
+		// Ignore error. The only error can be invalid tag key or value length, which we know are safe.
 		stats.RecordWithTags(ctx, []tag.Mutator{tag.Upsert(kGoBuildSuccess, status)},
 			mGoRunLatency.M(float64(time.Since(start))/float64(time.Millisecond)))
 	}()
-	exeBytes, err := os.ReadFile(exePath)
-	if err != nil {
-		return execRes, err
-	}
 	ctx, cancel := context.WithTimeout(ctx, maxRunTime)
 	defer cancel()
-	sreq, err := http.NewRequestWithContext(ctx, "POST", sandboxBackendURL(), bytes.NewReader(exeBytes))
-	if err != nil {
-		return execRes, fmt.Errorf("NewRequestWithContext %q: %w", sandboxBackendURL(), err)
+	cmd := exec.Command("docker", "run", "--rm", "-v", exePath+":/play.out", "debian:buster", "/play.out")
+	stdOut, stdErr := &bytes.Buffer{}, &bytes.Buffer{}
+	cmd.Stderr, cmd.Stdout = stdErr, stdOut
+	if err := cmd.Start(); err != nil {
+		execRes.Error = execRes.Error + "\n" + fmt.Sprintf("error run: %v", err)
+		return execRes, fmt.Errorf("error run: %v", err)
 	}
-	sreq.Header.Add("Idempotency-Key", "1") // lets Transport do retries with a POST
-	if testParam != "" {
-		sreq.Header.Add("X-Argument", testParam)
-	}
-	sreq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(exeBytes)), nil }
-	res, err := sandboxBackendClient().Do(sreq)
-	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			execRes.Error = runTimeoutError
-			return execRes, nil
+	if err := internal.WaitOrStop(ctx, cmd, os.Interrupt, 20*time.Second); err == nil {
+		execRes.Stdout = append(execRes.Stdout, stdOut.Bytes()...)
+		execRes.Stderr = append(execRes.Stderr, stdErr.Bytes()...)
+		execRes.ExitCode = cmd.ProcessState.ExitCode()
+		// fmt.Printf("Success execRes: %v\n", execRes)
+		return execRes, nil
+	} else {
+		if errors.Is(err, context.DeadlineExceeded) {
+			execRes.Error = fmt.Sprintln("Runtime Error.")
+		} else {
+			execRes.Error = execRes.Error + "\n" + fmt.Sprintf("Run Error: %v", err)
 		}
-		return execRes, fmt.Errorf("POST %q: %w", sandboxBackendURL(), err)
 	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		log.Printf("unexpected response from backend: %v", res.Status)
-		return execRes, fmt.Errorf("unexpected response from backend: %v", res.Status)
-	}
-	if err := json.NewDecoder(res.Body).Decode(&execRes); err != nil {
-		log.Printf("JSON decode error from backend: %v", err)
-		return execRes, errors.New("error parsing JSON from backend")
-	}
-	return execRes, nil
+	return execRes, err
 }
+
+// sandboxRun runs a Go binary in a sandbox environment.
+// func sandboxRun(ctx context.Context, exePath, testParam string) (execRes sandboxtypes.Response, err error) {
+// 	start := time.Now()
+// 	defer func() {
+// 		status := "success"
+// 		if err != nil {
+// 			status = "error"
+// 		}
+// 		// Ignore error. The only error can be invalid tag key or value
+// 		// length, which we know are safe.
+// 		stats.RecordWithTags(ctx, []tag.Mutator{tag.Upsert(kGoBuildSuccess, status)},
+// 			mGoRunLatency.M(float64(time.Since(start))/float64(time.Millisecond)))
+// 	}()
+// 	exeBytes, err := os.ReadFile(exePath)
+// 	if err != nil {
+// 		return execRes, err
+// 	}
+// 	ctx, cancel := context.WithTimeout(ctx, maxRunTime)
+// 	defer cancel()
+// 	sreq, err := http.NewRequestWithContext(ctx, "POST", sandboxBackendURL(), bytes.NewReader(exeBytes))
+// 	if err != nil {
+// 		return execRes, fmt.Errorf("NewRequestWithContext %q: %w", sandboxBackendURL(), err)
+// 	}
+// 	sreq.Header.Add("Idempotency-Key", "1") // lets Transport do retries with a POST
+// 	if testParam != "" {
+// 		sreq.Header.Add("X-Argument", testParam)
+// 	}
+// 	sreq.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(exeBytes)), nil }
+// 	res, err := sandboxBackendClient().Do(sreq)
+// 	if err != nil {
+// 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+// 			execRes.Error = runTimeoutError
+// 			return execRes, nil
+// 		}
+// 		return execRes, fmt.Errorf("POST %q: %w", sandboxBackendURL(), err)
+// 	}
+// 	defer res.Body.Close()
+// 	if res.StatusCode != http.StatusOK {
+// 		log.Printf("unexpected response from backend: %v", res.Status)
+// 		return execRes, fmt.Errorf("unexpected response from backend: %v", res.Status)
+// 	}
+// 	if err := json.NewDecoder(res.Body).Decode(&execRes); err != nil {
+// 		log.Printf("JSON decode error from backend: %v", err)
+// 		return execRes, errors.New("error parsing JSON from backend")
+// 	}
+// 	return execRes, nil
+// }
 
 // playgroundGoproxy returns the GOPROXY environment config the playground should use.
 // It is fetched from the environment variable PLAY_GOPROXY. A missing or empty
@@ -568,6 +613,33 @@ func playgroundGoproxy() string {
 		return proxypath
 	}
 	return "https://proxy.golang.org"
+}
+
+func playgroundGocache() string {
+	sysGocache := os.Getenv("GOCACHE")
+	if sysGocache == "" {
+		cwd, _ := os.Getwd()
+		sysGocache = cwd + "/gocache"
+	}
+	if _, err := os.Stat(sysGocache); err != nil {
+		os.Mkdir(sysGocache, 0o0755)
+	}
+	return sysGocache
+}
+
+func playgroundGoroot() string {
+	goroot := os.Getenv("GOROOT")
+	if goroot == "" {
+		gobin, err := exec.LookPath("go")
+		if err != nil {
+			cwd, _ := os.Getwd()
+			goroot = cwd + "/goroot"
+			return goroot
+		}
+		goroot = gobin[:len(gobin)-6]
+		return goroot
+	}
+	return goroot
 }
 
 // healthCheck attempts to build a binary from the source in healthProg.
@@ -663,3 +735,4 @@ import "fmt"
 
 func main() { fmt.Print("ok") }
 `
+
